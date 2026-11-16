@@ -1,8 +1,6 @@
 // WATCH THIS — a sprout cracks the pavement and a galaxy bursts out.
-// Deterministic procedural renderer: Node stdlib only, fixed seed, own PNG encoder.
+// Node stdlib only. Deterministic: fixed-seed mulberry32 PRNG, own PNG encoder.
 // Run: mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-// Output: <out>/entry.png — 1024x1024 RGB PNG, byte-identical across runs.
-
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as zlib from "node:zlib";
@@ -10,12 +8,10 @@ import * as zlib from "node:zlib";
 const W = 1024;
 const H = 1024;
 
-// ---------------------------------------------------------------------------
-// Deterministic PRNG (mulberry32, fixed seed). No Math.random / Date anywhere.
-// ---------------------------------------------------------------------------
+// ---------- deterministic PRNG ----------
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
-  return function (): number {
+  return function () {
     a |= 0;
     a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
@@ -23,313 +19,253 @@ function mulberry32(seed: number): () => number {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const rng = mulberry32(20261116);
+const rand = mulberry32(20261117);
 
-// ---------------------------------------------------------------------------
-// Pixel buffer (RGB) + drawing helpers
-// ---------------------------------------------------------------------------
-const px = new Uint8Array(W * H * 3);
+// ---------- framebuffer (RGB) ----------
+const img = Buffer.alloc(W * H * 3);
 
-function setPx(x: number, y: number, r: number, g: number, b: number): void {
-  if (x < 0 || y < 0 || x >= W || y >= H) return;
-  const i = (y * W + x) * 3;
-  px[i] = r;
-  px[i + 1] = g;
-  px[i + 2] = b;
+function setPixel(x: number, y: number, r: number, g: number, b: number): void {
+  const xi = Math.round(x);
+  const yi = Math.round(y);
+  if (xi < 0 || xi >= W || yi < 0 || yi >= H) return;
+  const i = (yi * W + xi) * 3;
+  img[i] = r;
+  img[i + 1] = g;
+  img[i + 2] = b;
 }
 
-function blendPx(x: number, y: number, r: number, g: number, b: number, a: number): void {
-  if (a <= 0) return;
-  if (x < 0 || y < 0 || x >= W || y >= H) return;
-  const i = (y * W + x) * 3;
-  if (a >= 1) {
-    px[i] = r;
-    px[i + 1] = g;
-    px[i + 2] = b;
-    return;
-  }
-  px[i] = Math.round(px[i] * (1 - a) + r * a);
-  px[i + 1] = Math.round(px[i + 1] * (1 - a) + g * a);
-  px[i + 2] = Math.round(px[i + 2] * (1 - a) + b * a);
-}
-
-// Soft disc (radial falloff) — used for stars, glow, galaxy dots.
-function disc(cx: number, cy: number, rad: number, r: number, g: number, b: number, alpha: number): void {
-  const x0 = Math.max(0, Math.floor(cx - rad));
-  const x1 = Math.min(W - 1, Math.ceil(cx + rad));
-  const y0 = Math.max(0, Math.floor(cy - rad));
-  const y1 = Math.min(H - 1, Math.ceil(cy + rad));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const d = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)) / rad;
-      if (d >= 1) continue;
-      const fall = (1 - d * d) * alpha;
-      blendPx(x, y, r, g, b, fall);
-    }
-  }
+function blendPixel(x: number, y: number, r: number, g: number, b: number, a: number): void {
+  const xi = Math.round(x);
+  const yi = Math.round(y);
+  if (xi < 0 || xi >= W || yi < 0 || yi >= H) return;
+  const i = (yi * W + xi) * 3;
+  img[i] = Math.round(r * a + img[i] * (1 - a));
+  img[i + 1] = Math.round(g * a + img[i + 1] * (1 - a));
+  img[i + 2] = Math.round(b * a + img[i + 2] * (1 - a));
 }
 
 function fillRect(x0: number, y0: number, x1: number, y1: number, r: number, g: number, b: number): void {
-  for (let y = Math.max(0, y0); y <= Math.min(H - 1, y1); y++) {
-    for (let x = Math.max(0, x0); x <= Math.min(W - 1, x1); x++) {
-      setPx(x, y, r, g, b);
+  for (let y = Math.max(0, Math.floor(y0)); y < Math.min(H, Math.ceil(y1)); y++) {
+    for (let x = Math.max(0, Math.floor(x0)); x < Math.min(W, Math.ceil(x1)); x++) {
+      setPixel(x, y, r, g, b);
     }
   }
 }
 
-// Bresenham line with a given thickness (drawn as small discs along the line).
-function thickLine(x0: number, y0: number, x1: number, y1: number, w: number, r: number, g: number, b: number): void {
-  const dx = x1 - x0;
-  const dy = y1 - y0;
-  const steps = Math.max(Math.abs(dx), Math.abs(dy));
-  for (let s = 0; s <= steps; s++) {
-    const t = steps === 0 ? 0 : s / steps;
-    disc(x0 + dx * t, y0 + dy * t, w / 2, r, g, b, 1);
-  }
-}
-
-// Filled polygon (scanline) — used for the speech-bubble tail.
-function fillPoly(pts: Array<[number, number]>, r: number, g: number, b: number): void {
-  let minY = H;
-  let maxY = 0;
-  for (const p of pts) {
-    if (p[1] < minY) minY = Math.floor(p[1]);
-    if (p[1] > maxY) maxY = Math.ceil(p[1]);
-  }
-  for (let y = Math.max(0, minY); y <= Math.min(H - 1, maxY); y++) {
-    const xs: number[] = [];
-    for (let i = 0; i < pts.length; i++) {
-      const a = pts[i];
-      const c = pts[(i + 1) % pts.length];
-      if ((a[1] <= y && c[1] > y) || (c[1] <= y && a[1] > y)) {
-        const t = (y - a[1]) / (c[1] - a[1]);
-        xs.push(a[0] + t * (c[0] - a[0]));
-      }
-    }
-    xs.sort((p, q) => p - q);
-    for (let k = 0; k + 1 < xs.length; k += 2) {
-      for (let x = Math.max(0, Math.ceil(xs[k])); x <= Math.min(W - 1, Math.floor(xs[k + 1])); x++) {
-        setPx(x, y, r, g, b);
-      }
+// soft glowing disc: alpha falls off linearly to the edge
+function softDisc(cx: number, cy: number, rad: number, r: number, g: number, b: number, alpha: number): void {
+  const rr = Math.ceil(rad);
+  for (let y = Math.floor(cy - rr); y <= Math.ceil(cy + rr); y++) {
+    for (let x = Math.floor(cx - rr); x <= Math.ceil(cx + rr); x++) {
+      const d = Math.hypot(x - cx, y - cy);
+      if (d > rad) continue;
+      blendPixel(x, y, r, g, b, alpha * (1 - d / rad));
     }
   }
 }
 
-// Rounded rectangle, filled.
-function roundRect(x0: number, y0: number, x1: number, y1: number, rad: number, r: number, g: number, b: number): void {
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const cx = Math.min(Math.max(x, x0 + rad), x1 - rad);
-      const cy = Math.min(Math.max(y, y0 + rad), y1 - rad);
-      const d = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
-      if (d <= rad) setPx(x, y, r, g, b);
+// solid disc
+function disc(cx: number, cy: number, rad: number, r: number, g: number, b: number): void {
+  const rr = Math.ceil(rad);
+  for (let y = Math.floor(cy - rr); y <= Math.ceil(cy + rr); y++) {
+    for (let x = Math.floor(cx - rr); x <= Math.ceil(cx + rr); x++) {
+      if (Math.hypot(x - cx, y - cy) <= rad) setPixel(x, y, r, g, b);
     }
   }
 }
 
-// ---------------------------------------------------------------------------
-// 1. Sky: deep indigo gradient + stars
-// ---------------------------------------------------------------------------
-function drawSky(): void {
-  for (let y = 0; y < H; y++) {
-    const t = y / H;
-    // indigo top -> dark violet -> warm dusk haze near the horizon
-    const r = Math.round(10 + 46 * t * t);
-    const g = Math.round(10 + 26 * t * t);
-    const b = Math.round(46 + 34 * t);
-    for (let x = 0; x < W; x++) setPx(x, y, r, g, b);
-  }
-  // stars
-  for (let i = 0; i < 260; i++) {
-    const x = rng() * W;
-    const y = rng() * 700;
-    const bright = 120 + Math.floor(rng() * 135);
-    const rad = rng() < 0.85 ? 1 : 2;
-    disc(x, y, rad, bright, bright, Math.min(255, bright + 20), 0.55 + rng() * 0.45);
+// thick line drawn as a chain of discs
+function thickLine(x0: number, y0: number, x1: number, y1: number, rad: number, r: number, g: number, b: number): void {
+  const steps = Math.ceil(Math.hypot(x1 - x0, y1 - y0));
+  for (let i = 0; i <= steps; i++) {
+    const t = steps === 0 ? 0 : i / steps;
+    disc(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, rad, r, g, b);
   }
 }
 
-// ---------------------------------------------------------------------------
-// 2. Spiral galaxy bursting upward (3 arms, magenta / cyan / gold)
-// ---------------------------------------------------------------------------
-const GALAXY: Array<[number, number, number]> = [
-  [255, 47, 214], // magenta
-  [25, 227, 255], // cyan
-  [255, 210, 62], // gold
+// filled ellipse, rotated by angle (radians), centred at (cx, cy)
+function ellipse(cx: number, cy: number, a: number, b: number, angle: number, r: number, g: number, bl: number): void {
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const R = Math.ceil(Math.max(a, b));
+  for (let y = Math.floor(cy - R); y <= Math.ceil(cy + R); y++) {
+    for (let x = Math.floor(cx - R); x <= Math.ceil(cx + R); x++) {
+      const dx = x - cx;
+      const dy = y - cy;
+      const u = dx * cos + dy * sin;
+      const v = -dx * sin + dy * cos;
+      if ((u * u) / (a * a) + (v * v) / (b * b) <= 1) setPixel(x, y, r, g, bl);
+    }
+  }
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+// ---------- 1. sky: dark vertical gradient ----------
+const skyTop: [number, number, number] = [7, 9, 38];
+const skyBottom: [number, number, number] = [43, 18, 72];
+const HORIZON = 640;
+for (let y = 0; y < HORIZON; y++) {
+  const t = y / HORIZON;
+  const r = Math.round(lerp(skyTop[0], skyBottom[0], t));
+  const g = Math.round(lerp(skyTop[1], skyBottom[1], t));
+  const b = Math.round(lerp(skyTop[2], skyBottom[2], t));
+  fillRect(0, y, W, y + 1, r, g, b);
+}
+
+// ---------- 2. stars ----------
+for (let i = 0; i < 260; i++) {
+  const x = rand() * W;
+  const y = rand() * 620;
+  const bright = 140 + Math.floor(rand() * 115);
+  const warm = rand();
+  const r = bright;
+  const g = warm < 0.3 ? Math.round(bright * 0.85) : bright;
+  const b = warm < 0.3 ? Math.round(bright * 0.7) : bright;
+  if (rand() < 0.12) {
+    // sparkle star with cross arms
+    disc(x, y, 1.6, r, g, b);
+    thickLine(x - 5, y, x + 5, y, 0.8, r, g, b);
+    thickLine(x, y - 5, x, y + 5, 0.8, r, g, b);
+  } else {
+    disc(x, y, rand() < 0.7 ? 1 : 1.7, r, g, b);
+  }
+}
+
+// ---------- 3. spiral galaxy: 3 arms bursting upward ----------
+const GCX = 512;
+const GCY = 470;
+const armColors: [number, number, number][] = [
+  [255, 64, 200], // magenta
+  [64, 220, 255], // cyan
+  [255, 200, 64], // gold
 ];
-
-function drawGalaxy(): void {
-  const cx = 512;
-  const cy = 392;
-  // core glow
-  for (let r = 150; r > 0; r -= 6) {
-    const a = 0.05 + 0.22 * (1 - r / 150);
-    disc(cx, cy, r, 255, 240, 250, a * 0.35);
-  }
-  disc(cx, cy, 34, 255, 255, 255, 0.9);
-  disc(cx, cy, 18, 255, 245, 220, 1);
-  // spiral arms
-  const arms = 3;
-  for (let arm = 0; arm < arms; arm++) {
-    const off = (arm * Math.PI * 2) / arms;
-    for (let s = 0; s < 520; s++) {
-      const t = s / 520; // 0 core -> 1 rim
-      const ang = off + t * Math.PI * 4.4;
-      const rad = 14 + 268 * Math.pow(t, 0.92);
-      const jx = (rng() - 0.5) * (10 + 34 * t);
-      const jy = (rng() - 0.5) * (8 + 26 * t);
-      const x = cx + Math.cos(ang) * rad + jx;
-      const y = cy + Math.sin(ang) * rad * 0.6 + jy;
-      const col = GALAXY[(arm + Math.floor(t * 3)) % 3];
-      const size = 1.2 + (1 - t) * 3.4 + rng() * 1.6;
-      const alpha = 0.35 + (1 - t) * 0.6;
-      disc(x, y, size, col[0], col[1], col[2], alpha);
-      // occasional bright spark on the arm
-      if (rng() < 0.06) disc(x, y, size + 2.5, 255, 255, 255, 0.8);
-    }
+// bright core glow
+softDisc(GCX, GCY, 70, 255, 240, 200, 0.55);
+softDisc(GCX, GCY, 38, 255, 250, 230, 0.8);
+softDisc(GCX, GCY, 16, 255, 255, 255, 0.95);
+for (let arm = 0; arm < 3; arm++) {
+  const base = (arm * Math.PI * 2) / 3;
+  const col = armColors[arm];
+  for (let i = 0; i < 520; i++) {
+    const t = i / 519;
+    const ang = base + t * Math.PI * 3.4;
+    const rad = 26 + t * 285;
+    const spread = 6 + t * 34;
+    const ox = (rand() + rand() + rand() - 1.5) * spread;
+    const oy = (rand() + rand() + rand() - 1.5) * spread;
+    const x = GCX + Math.cos(ang) * rad + ox;
+    const y = GCY + Math.sin(ang) * rad * 0.92 + oy;
+    const size = 1.2 + rand() * 2.6 * (1 - t * 0.5);
+    const alpha = 0.35 + rand() * 0.5;
+    softDisc(x, y, size, col[0], col[1], col[2], alpha);
+    if (rand() < 0.22) setPixel(x, y, 255, 255, 255);
   }
 }
 
-// ---------------------------------------------------------------------------
-// 3. Pavement: grey slabs with joints + speckle, horizon at y = 720
-// ---------------------------------------------------------------------------
-function drawPavement(): void {
-  const top = 720;
-  // base
-  for (let y = top; y < H; y++) {
-    for (let x = 0; x < W; x++) setPx(x, y, 96, 99, 106);
+// ---------- 4. pavement: 3 rows of grey slabs ----------
+const rows: [number, number][] = [
+  [640, 758],
+  [758, 876],
+  [876, 1024],
+];
+const joints: number[][] = [
+  [180, 420, 700, 900],
+  [90, 330, 560, 800],
+  [220, 480, 760],
+];
+for (let ri = 0; ri < 3; ri++) {
+  const [y0, y1] = rows[ri];
+  let prevX = 0;
+  const js = [...joints[ri], W];
+  for (const jx of js) {
+    const shade = 100 + Math.floor(rand() * 22);
+    fillRect(prevX, y0, jx, y1, shade, shade + 4, shade + 10);
+    prevX = jx;
   }
-  // slab shading: columns 256 wide, rows split at 836 and 934
-  const rows: Array<[number, number]> = [
-    [top, 836],
-    [837, 934],
-    [935, H - 1],
+  // horizontal joint line
+  fillRect(0, y0, W, y0 + 3, 66, 68, 76);
+  for (const jx of joints[ri]) {
+    fillRect(jx - 1, y0, jx + 2, y1, 66, 68, 76);
+  }
+}
+
+// ---------- 5. branching cracks from the sprout base ----------
+function crackWalk(x: number, y: number, angle: number, steps: number, width: number, depth: number): void {
+  let cx = x;
+  let cy = y;
+  let a = angle;
+  for (let i = 0; i < steps; i++) {
+    const len = 9 + rand() * 7;
+    const nx = cx + Math.cos(a) * len;
+    const ny = cy + Math.sin(a) * len;
+    thickLine(cx, cy, nx, ny, width, 38, 38, 46);
+    cx = nx;
+    cy = ny;
+    a += (rand() - 0.5) * 0.7;
+    if (depth < 2 && rand() < 0.3) {
+      crackWalk(cx, cy, a + (rand() < 0.5 ? 0.9 : -0.9), Math.floor(steps * 0.45), Math.max(1, width - 1), depth + 1);
+    }
+    if (cy > 1010) break;
+  }
+}
+crackWalk(512, 644, Math.PI / 2 + 0.5, 16, 3, 0); // down-left
+crackWalk(512, 644, Math.PI / 2, 20, 3, 0); // straight down
+crackWalk(512, 644, Math.PI / 2 - 0.5, 15, 3, 0); // down-right
+crackWalk(512, 644, Math.PI, 8, 2, 0); // along the slab seam, left
+crackWalk(512, 644, 0, 8, 2, 0); // along the slab seam, right
+
+// ---------- 6. the sprout: bezier stem, two leaves, one bud ----------
+const P0: [number, number] = [512, 648];
+const P1: [number, number] = [498, 585];
+const P2: [number, number] = [516, 512];
+for (let i = 0; i <= 40; i++) {
+  const t = i / 40;
+  const mt = 1 - t;
+  const x = mt * mt * P0[0] + 2 * mt * t * P1[0] + t * t * P2[0];
+  const y = mt * mt * P0[1] + 2 * mt * t * P1[1] + t * t * P2[1];
+  const r = lerp(6.5, 3, t);
+  const gcol: [number, number, number] = [
+    Math.round(lerp(26, 96, t)),
+    Math.round(lerp(110, 205, t)),
+    Math.round(lerp(46, 105, t)),
   ];
-  for (const [ry0, ry1] of rows) {
-    for (let c = 0; c < 4; c++) {
-      const shade = Math.floor((rng() - 0.5) * 22);
-      const x0 = c * 256;
-      const x1 = Math.min(W - 1, x0 + 255);
-      for (let y = ry0; y <= ry1; y++) {
-        for (let x = x0; x <= x1; x++) {
-          const i = (y * W + x) * 3;
-          px[i] = Math.max(0, Math.min(255, px[i] + shade));
-          px[i + 1] = Math.max(0, Math.min(255, px[i + 1] + shade));
-          px[i + 2] = Math.max(0, Math.min(255, px[i + 2] + shade));
-        }
-      }
-    }
-  }
-  // speckle
-  for (let i = 0; i < 5200; i++) {
-    const x = Math.floor(rng() * W);
-    const y = top + Math.floor(rng() * (H - top));
-    const v = rng() < 0.5 ? -14 : 12;
-    const idx = (y * W + x) * 3;
-    px[idx] = Math.max(0, Math.min(255, px[idx] + v));
-    px[idx + 1] = Math.max(0, Math.min(255, px[idx + 1] + v));
-    px[idx + 2] = Math.max(0, Math.min(255, px[idx + 2] + v));
-  }
-  // joints
-  thickLine(0, 836, W - 1, 836, 3, 52, 54, 60);
-  thickLine(0, 934, W - 1, 934, 3, 52, 54, 60);
-  for (let c = 1; c < 4; c++) thickLine(c * 256, top, c * 256, H - 1, 3, 52, 54, 60);
-  // horizon highlight
-  thickLine(0, top, W - 1, top, 2, 150, 153, 160);
+  disc(x, y, r, gcol[0], gcol[1], gcol[2]);
+}
+// leaves (solid green)
+ellipse(486, 580, 46, 19, -0.62, 52, 168, 76);
+ellipse(542, 568, 50, 21, 0.62, 70, 190, 92);
+// bud at the tip
+disc(516, 508, 11, 140, 235, 130);
+disc(516, 503, 6, 195, 250, 175);
+
+// REVISI 2 — two-tone leaves: lighter highlight + midrib and veins
+ellipse(478, 572, 30, 11, -0.62, 110, 215, 120);
+ellipse(550, 560, 32, 12, 0.62, 130, 225, 140);
+// left leaf: midrib along the major axis, two veins branching off
+thickLine(454, 603, 518, 557, 1, 30, 120, 50);
+thickLine(478, 588, 466, 570, 1, 30, 120, 50);
+thickLine(496, 574, 508, 592, 1, 30, 120, 50);
+// right leaf: midrib along the major axis, two veins branching off
+thickLine(510, 591, 574, 545, 1, 40, 135, 60);
+thickLine(534, 572, 522, 554, 1, 40, 135, 60);
+thickLine(552, 560, 564, 578, 1, 40, 135, 60);
+
+// REVISI 2 — gold pollen sparkles drifting up from the sprout
+function sparkle(cx: number, cy: number, s: number): void {
+  thickLine(cx - s, cy, cx + s, cy, 1, 255, 210, 90);
+  thickLine(cx, cy - s, cx, cy + s, 1, 255, 210, 90);
+  disc(cx, cy, 1.6, 255, 235, 150);
+}
+for (let i = 0; i < 26; i++) {
+  const x = 380 + rand() * 280;
+  const y = 360 + rand() * 260;
+  sparkle(x, y, 3 + rand() * 5);
 }
 
-// ---------------------------------------------------------------------------
-// 4. Crack in the pavement, splitting around the sprout
-// ---------------------------------------------------------------------------
-function drawCrack(): void {
-  let x = 512;
-  let y = 720;
-  let px0 = x;
-  let py0 = y;
-  while (y < 1000) {
-    const step = 16 + rng() * 16;
-    const drift = (rng() - 0.5) * 46;
-    x += drift;
-    y += step;
-    thickLine(px0, py0, x, y, 4, 38, 40, 46);
-    px0 = x;
-    py0 = y;
-    // branch
-    if (rng() < 0.35) {
-      let bx = x;
-      let by = y;
-      const dir = rng() < 0.5 ? -1 : 1;
-      for (let b = 0; b < 4; b++) {
-        const nx = bx + dir * (14 + rng() * 18);
-        const ny = by + 12 + rng() * 14;
-        thickLine(bx, by, nx, ny, 2.5, 38, 40, 46);
-        bx = nx;
-        by = ny;
-      }
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 5. Sprout: curved stem + two leaves + bud, rising from the crack
-// ---------------------------------------------------------------------------
-function drawSprout(): void {
-  // stem as quadratic bezier from (512,722) to (500,548), control (548,640)
-  const p0: [number, number] = [512, 722];
-  const p1: [number, number] = [548, 640];
-  const p2: [number, number] = [500, 548];
-  const N = 60;
-  for (let s = 0; s <= N; s++) {
-    const t = s / N;
-    const x = (1 - t) * (1 - t) * p0[0] + 2 * (1 - t) * t * p1[0] + t * t * p2[0];
-    const y = (1 - t) * (1 - t) * p0[1] + 2 * (1 - t) * t * p1[1] + t * t * p2[1];
-    const rad = 7.5 - 4.5 * t;
-    disc(x, y, rad, 46, 168, 80, 1);
-    disc(x - 1.5, y - 1.5, rad * 0.55, 96, 214, 122, 0.9);
-  }
-  // leaves: solid-filled rotated ellipses (two-tone green, darker rim, vein)
-  function leaf(cx: number, cy: number, rx: number, ry: number, ang: number): void {
-    const cos = Math.cos(ang);
-    const sin = Math.sin(ang);
-    const x0 = Math.floor(cx - rx - 2);
-    const x1 = Math.ceil(cx + rx + 2);
-    const y0 = Math.floor(cy - ry - 2);
-    const y1 = Math.ceil(cy + ry + 2);
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        const dx = x - cx;
-        const dy = y - cy;
-        const lx = dx * cos + dy * sin;
-        const ly = -dx * sin + dy * cos;
-        const q = (lx * lx) / (rx * rx) + (ly * ly) / (ry * ry);
-        if (q > 1) continue;
-        if (q < 0.45) setPx(x, y, 104, 220, 130);
-        else if (q < 0.85) setPx(x, y, 52, 186, 92);
-        else setPx(x, y, 34, 148, 72);
-      }
-    }
-    // vein
-    const vx = Math.cos(ang);
-    const vy = Math.sin(ang);
-    thickLine(cx - vx * rx * 0.8, cy - vy * rx * 0.8, cx + vx * rx * 0.8, cy + vy * rx * 0.8, 2, 30, 130, 62);
-  }
-  leaf(478, 636, 34, 13, -0.55);
-  leaf(540, 606, 36, 14, 0.5);
-  // bud on top
-  disc(500, 544, 8, 120, 226, 140, 1);
-  disc(498, 541, 4, 190, 245, 200, 1);
-  // golden pollen sparkles drifting around the sprout
-  for (let i = 0; i < 26; i++) {
-    const px2 = 470 + rng() * 90;
-    const py2 = 540 + rng() * 180;
-    const gold = rng() < 0.6;
-    disc(px2, py2, 1 + rng() * 1.6, gold ? 255 : 120, gold ? 210 : 230, gold ? 62 : 255, 0.6 + rng() * 0.4);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 6. Speech bubble with bitmap text "WATCH THIS"
-// ---------------------------------------------------------------------------
+// ---------- 7. speech bubble: "WATCH THIS" in a 5x7 bitmap font ----------
 const FONT: Record<string, string[]> = {
   W: ["#...#", "#...#", "#...#", "#.#.#", "#.#.#", ".#.#.", ".#.#."],
   A: [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
@@ -348,7 +284,7 @@ function drawText(text: string, x0: number, y0: number, scale: number, r: number
     for (let row = 0; row < 7; row++) {
       for (let col = 0; col < 5; col++) {
         if (glyph[row][col] === "#") {
-          fillRect(cx + col * scale, y0 + row * scale, cx + col * scale + scale - 1, y0 + row * scale + scale - 1, r, g, b);
+          fillRect(cx + col * scale, y0 + row * scale, cx + (col + 1) * scale, y0 + (row + 1) * scale, r, g, b);
         }
       }
     }
@@ -356,66 +292,63 @@ function drawText(text: string, x0: number, y0: number, scale: number, r: number
   }
 }
 
-function drawBubble(): void {
-  const x0 = 556;
-  const y0 = 52;
-  const x1 = 976;
-  const y1 = 198;
-  const ink: [number, number, number] = [20, 32, 74];
-  // outline (bigger shape behind)
-  roundRect(x0 - 4, y0 - 4, x1 + 4, y1 + 4, 30, ink[0], ink[1], ink[2]);
-  fillPoly(
-    [
-      [648, y1 + 2],
-      [592, 252],
-      [700, y1 + 2],
-    ],
-    ink[0],
-    ink[1],
-    ink[2],
-  );
-  // white body
-  roundRect(x0, y0, x1, y1, 26, 255, 255, 255);
-  fillPoly(
-    [
-      [652, y1 - 1],
-      [600, 244],
-      [694, y1 - 1],
-    ],
-    255,
-    255,
-    255,
-  );
-  // text: "WATCH THIS" — 10 glyphs, scale 6 -> 10*36-6 = 354 px wide
-  drawText("WATCH THIS", x0 + 33, y0 + 52, 6, ink[0], ink[1], ink[2]);
+function roundRect(x0: number, y0: number, x1: number, y1: number, rad: number, r: number, g: number, b: number): void {
+  fillRect(x0 + rad, y0, x1 - rad, y1, r, g, b);
+  fillRect(x0, y0 + rad, x1, y1 - rad, r, g, b);
+  disc(x0 + rad, y0 + rad, rad, r, g, b);
+  disc(x1 - rad, y0 + rad, rad, r, g, b);
+  disc(x0 + rad, y1 - rad, rad, r, g, b);
+  disc(x1 - rad, y1 - rad, rad, r, g, b);
 }
 
-// ---------------------------------------------------------------------------
-// PNG encoder (own CRC32 + per-row filter choice, zlib deflate level 9)
-// ---------------------------------------------------------------------------
-const CRC_TABLE: number[] = (() => {
-  const table: number[] = [];
+const BX0 = 600;
+const BY0 = 52;
+const BX1 = 968;
+const BY1 = 172;
+// tail pointing down-left toward the sprout tip
+fillRect(640, BY1 - 2, 716, BY1 + 2, 250, 250, 252);
+for (let i = 0; i < 90; i++) {
+  const t = i / 90;
+  const x = lerp(648, 560, t);
+  const y = BY1 + t * 92;
+  const half = lerp(34, 2, t);
+  fillRect(x - half, y, x + half, y + 2, 250, 250, 252);
+}
+roundRect(BX0, BY0, BX1, BY1, 18, 250, 250, 252);
+// border
+thickLine(BX0 + 18, BY0, BX1 - 18, BY0, 2, 40, 40, 55);
+thickLine(BX0 + 18, BY1, BX1 - 18, BY1, 2, 40, 40, 55);
+thickLine(BX0, BY0 + 18, BX0, BY1 - 18, 2, 40, 40, 55);
+thickLine(BX1, BY0 + 18, BX1, BY1 - 18, 2, 40, 40, 55);
+const label = "WATCH THIS";
+const scale = 4;
+const textW = label.length * 6 * scale - scale;
+drawText(label, Math.round((BX0 + BX1 - textW) / 2), Math.round((BY0 + BY1 - 7 * scale) / 2), scale, 24, 24, 48);
+
+// ---------- PNG encoder: CRC32 + per-row filter choice + zlib 9 ----------
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c >>> 0;
+    t[n] = c;
   }
-  return table;
+  return t;
 })();
 
 function crc32(buf: Buffer): number {
   let c = 0xffffffff;
-  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
 
-function pngChunk(type: string, data: Buffer): Buffer {
+function chunk(type: string, data: Buffer): Buffer {
   const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length, 0);
-  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  len.writeUInt32BE(data.length);
+  const td = Buffer.concat([Buffer.from(type, "ascii"), data]);
   const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(body), 0);
-  return Buffer.concat([len, body, crc]);
+  crc.writeUInt32BE(crc32(td));
+  return Buffer.concat([len, td, crc]);
 }
 
 function paeth(a: number, b: number, c: number): number {
@@ -423,12 +356,47 @@ function paeth(a: number, b: number, c: number): number {
   const pa = Math.abs(p - a);
   const pb = Math.abs(p - b);
   const pc = Math.abs(p - c);
-  if (pa <= pb && pa <= pc) return a;
-  if (pb <= pc) return b;
-  return c;
+  return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
 }
 
-function encodePng(): Buffer {
+function encodePNG(): Buffer {
+  const stride = W * 3;
+  const raw = Buffer.alloc(H * (stride + 1));
+  let prev: Buffer | null = null;
+  for (let y = 0; y < H; y++) {
+    const row = img.subarray(y * stride, (y + 1) * stride);
+    let best: Buffer | null = null;
+    let bestF = 0;
+    let bestScore = Infinity;
+    for (let f = 0; f <= 4; f++) {
+      const out = Buffer.alloc(stride);
+      for (let x = 0; x < stride; x++) {
+        const v = row[x];
+        const left = x >= 3 ? row[x - 3] : 0;
+        const up = prev ? prev[x] : 0;
+        const upLeft = x >= 3 && prev ? prev[x - 3] : 0;
+        let pred = 0;
+        if (f === 1) pred = left;
+        else if (f === 2) pred = up;
+        else if (f === 3) pred = Math.floor((left + up) / 2);
+        else if (f === 4) pred = paeth(left, up, upLeft);
+        out[x] = (v - pred) & 0xff;
+      }
+      let score = 0;
+      for (let x = 0; x < stride; x++) {
+        const s = out[x] >= 128 ? out[x] - 256 : out[x];
+        score += s < 0 ? -s : s;
+      }
+      if (score < bestScore) {
+        bestScore = score;
+        best = out;
+        bestF = f;
+      }
+    }
+    raw[y * (stride + 1)] = bestF;
+    best!.copy(raw, y * (stride + 1) + 1);
+    prev = row;
+  }
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(W, 0);
   ihdr.writeUInt32BE(H, 4);
@@ -437,67 +405,18 @@ function encodePng(): Buffer {
   ihdr[10] = 0;
   ihdr[11] = 0;
   ihdr[12] = 0;
-
-  const stride = W * 3;
-  const raw = Buffer.alloc((stride + 1) * H);
-  const prev = new Uint8Array(stride);
-  for (let y = 0; y < H; y++) {
-    const row = px.subarray(y * stride, (y + 1) * stride);
-    let bestFilter = 0;
-    let bestScore = Infinity;
-    let best: Buffer | null = null;
-    for (let f = 0; f <= 4; f++) {
-      const out = Buffer.alloc(stride);
-      let score = 0;
-      for (let x = 0; x < stride; x++) {
-        const v = row[x];
-        const a = x >= 3 ? row[x - 3] : 0;
-        const b = prev[x];
-        const c = x >= 3 ? prev[x - 3] : 0;
-        let pred = 0;
-        if (f === 1) pred = a;
-        else if (f === 2) pred = b;
-        else if (f === 3) pred = Math.floor((a + b) / 2);
-        else if (f === 4) pred = paeth(a, b, c);
-        const d = (v - pred) & 0xff;
-        out[x] = d;
-        score += Math.abs(d >= 128 ? d - 256 : d);
-      }
-      if (score < bestScore) {
-        bestScore = score;
-        bestFilter = f;
-        best = out;
-      }
-    }
-    raw[y * (stride + 1)] = bestFilter;
-    (best as Buffer).copy(raw, y * (stride + 1) + 1);
-    prev.set(row);
-  }
   const idat = zlib.deflateSync(raw, { level: 9 });
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk("IHDR", ihdr),
-    pngChunk("IDAT", idat),
-    pngChunk("IEND", Buffer.alloc(0)),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", idat),
+    chunk("IEND", Buffer.alloc(0)),
   ]);
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-function main(): void {
-  drawSky();
-  drawGalaxy();
-  drawPavement();
-  drawCrack();
-  drawSprout();
-  drawBubble();
-  const png = encodePng();
-  const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "out";
-  fs.mkdirSync(outDir, { recursive: true });
-  const outPath = path.join(outDir, "entry.png");
-  fs.writeFileSync(outPath, png);
-  console.log(`wrote ${outPath} (${png.length} bytes, ${W}x${H})`);
-}
-
-main();
+const outDir = process.env.MAKEFUN_OUTPUT_DIR || "out";
+fs.mkdirSync(outDir, { recursive: true });
+const png = encodePNG();
+const outPath = path.join(outDir, "image.png");
+fs.writeFileSync(outPath, png);
+console.log(`wrote ${outPath} (${png.length} bytes)`);
